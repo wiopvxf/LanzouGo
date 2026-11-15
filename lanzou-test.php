@@ -512,8 +512,10 @@ tbody tr:last-child td{border-bottom:none}
     <div class="card">
       <div class="t"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg>检查更新</div>
       <div id="verBox" class="dval">尚未检查</div>
-      <div class="inrow" style="margin-top:9px"><button type="button" style="flex:1" onclick="checkUpdate()">检查更新</button><button type="button" class="btn gray" style="flex:0 0 118px" onclick="doUpdate()">一键更新</button></div>
-      <div style="font-size:11.5px;color:var(--weak);margin-top:9px;line-height:1.6">对比 GitHub Release 最新版本；更新会替换程序并自动重启。GitHub API 限流时可在 lanzou.json 配置 github_token。</div>
+      <div class="inrow" style="margin-top:9px"><input type="number" id="updInterval" placeholder="自动检查间隔（分钟）" min="1" max="1440" step="1" aria-label="自动检查间隔" /></div>
+      <div class="inrow"><button type="button" style="flex:1" onclick="checkUpdate()">检查更新</button><button type="button" class="btn gray" style="flex:0 0 118px" id="autoUpdBtn" onclick="toggleAutoUpdate()">自动更新：开</button></div>
+      <div class="inrow"><button type="button" style="flex:1" onclick="doUpdate()">立即更新到最新版</button><button type="button" class="btn gray" style="flex:0 0 118px" onclick="saveUpdInterval()">保存间隔</button></div>
+      <div style="font-size:11.5px;color:var(--weak);margin-top:9px;line-height:1.6">自动更新默认开启：服务启动即检查一次，发现新版本自动下载、替换并重启；之后按间隔轮询。关闭后只能手动更新。GitHub API 限流时可在 lanzou.json 配置 github_token。</div>
     </div>
     <div class="card">
       <div class="t"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>高级：手动写入 Cookie（一般不需要）</div>
@@ -1152,7 +1154,15 @@ function loadStatus() {
         lvInput.value = Object.keys(d.level_limits).map(k => k + '=' + d.level_limits[k]).join(',');
       }
       const vBox = document.getElementById('verBox');
-      if (vBox && d.version) vBox.innerHTML = '当前版本：<span style="font-family:var(--font-m)">' + escHtml(d.version) + '</span>（点“检查更新”对比最新版）';
+      if (vBox && d.version) {
+        vBox.innerHTML = '当前版本：<span style="font-family:var(--font-m)">' + escHtml(d.version) + '</span>' +
+          '<br />自动更新：' + (d.auto_update ? '<span style="color:#86efac">已开启</span>（每 ' + (d.auto_update_interval_min || 30) + ' 分钟检查）' : '<span style="color:#94a3b8">已关闭</span>');
+      }
+      window._autoUpdate = !!d.auto_update;
+      const autoBtn = document.getElementById('autoUpdBtn');
+      if (autoBtn) autoBtn.textContent = '自动更新：' + (window._autoUpdate ? '开' : '关');
+      const upIv = document.getElementById('updInterval');
+      if (upIv && document.activeElement !== upIv && d.auto_update_interval_min) upIv.value = d.auto_update_interval_min;
 
       if (d.last_error && /账号登录失败/.test(d.last_error)) toast('账号登录失败', 'err');
     })
@@ -1261,6 +1271,36 @@ function checkUpdate() {
         '<br /><span style="color:var(--weak);font-size:11.5px">检查时间：' + escHtml(d.checked_at || '') + '</span>';
       if (box) box.innerHTML = html;
       toast(d.has_update ? '发现新版本 ' + (d.latest || '') : '已是最新版本', d.has_update ? 'ok' : 'ok');
+    })
+    .catch(e => toast('请求失败', 'err'));
+}
+
+function toggleAutoUpdate() {
+  const want = window._autoUpdate ? '0' : '1';
+  const fd = new FormData();
+  fd.append('auto_update', want);
+  fetch('/lanzou-test.php?ajax=limits', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(j => {
+      if (j.code === 0) {
+        window._autoUpdate = want === '1';
+        toast('自动更新已' + (window._autoUpdate ? '开启（新版本会自动安装）' : '关闭'), 'ok');
+        loadStatus();
+      } else toast('设置失败：' + (j.msg || ''), 'err');
+    })
+    .catch(e => toast('请求失败', 'err'));
+}
+
+function saveUpdInterval() {
+  const v = document.getElementById('updInterval').value.trim();
+  if (!v) { toast('请填写检查间隔（分钟）', 'err'); return; }
+  const fd = new FormData();
+  fd.append('auto_update_interval_min', v);
+  fetch('/lanzou-test.php?ajax=limits', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(j => {
+      if (j.code === 0) { toast('自动检查间隔已设为 ' + v + ' 分钟', 'ok'); loadStatus(); }
+      else toast('保存失败：' + (j.msg || ''), 'err');
     })
     .catch(e => toast('请求失败', 'err'));
 }

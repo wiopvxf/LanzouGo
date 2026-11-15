@@ -1,7 +1,8 @@
-# LanzouGo v1.2.0 — 蓝奏云三合一管理服务（Go）
+# LanzouGo v1.3.0 — 蓝奏云三合一管理服务（Go）
 
 把三块能力整合进**一个 Go 二进制**：**上传 + 文件列表 + 分享解析直链**。
 v1.1 起支持**账号密码登录**：登录后自动获取 Cookie，Cookie 失效自动重新登录，账号信息（UID / VIP / 上传上限）自动获取。
+v1.3 加入 **自动更新**：启动即检查 GitHub Release，发现新版本自动下载、替换二进制并重启（默认开启，可关）。
 v1.2 加入 **VIP 自动检测**（等级 / 到期时间 / 剩余天数 / 容量）、**按 VIP 切换重命名机制与上传上限**、**受限后缀自动加 `(c).zip`**、**上传文件名校验**、**检查更新 + 一键自更新**。
 
 - 纯 Go 标准库实现，**零第三方依赖**，原生 net/http
@@ -39,7 +40,8 @@ curl -X POST -d "cookie=phpdisk_info=xxx" http://127.0.0.1:8080/api/cookie
 | 后缀修复 | 上传名为受限后缀（exe/bat/apk 等，内置清单 + `blocked_ext` 可扩展）时，实际存为 `原名.exe(c).zip`；**列表展示与下载自动去掉 `(c).zip`**，用户无感 |
 | 文件名校验 | 上传/重命名时文件名不能为空白，且**至少 2 个字符**，否则直接 400，不会白传 |
 | 检查更新 | `GET /api/version` 对比 GitHub Release（限流时可配 `github_token` 或用 `-check-update`） |
-| 自更新 | `POST /api/update`（`confirm=1`）下载对应平台二进制 → 替换 → 自动重启；可 `allow_update=0` 关闭 |
+| 自更新 | `POST /api/update`（`confirm=1`）下载对应平台二进制 → 替换 → 自动重启 |
+| **自动更新** | **默认开启**：启动 8 秒后检查一次，发现新版本**立即**下载 → 替换 → 重启；之后每 `auto_update_interval_min`（默认 30）分钟轮询。`auto_update=0` 关闭，`allow_update=0` 为总开关 |
 | Cookie 不外泄 | 所有响应不含 Cookie；`/api/status` 只给 `sha256:` 前 8 位摘要；下载代理不携带登录 Cookie |
 
 ## 接口一览
@@ -101,7 +103,8 @@ curl "http://127.0.0.1:8080/api/parse?url=https://wwi.lanzou.com/xxxx&pwd=密码
 | `-maxupload` | 100 | VIP 账号单文件上限（MB），非 VIP 始终 100MB |
 | `-check-update` | 无 | 打印当前版本与 GitHub 最新版本后退出 |
 | `-update` | 无 | 检查并直接执行自更新（替换二进制）后退出 |
-| `-no-update` | 无 | 关闭自更新接口（写回配置 `allow_update=false`） |
+| `-no-update` | 无 | 关闭自更新（写回 `allow_update=false`、`auto_update=false`） |
+| `-no-auto-update` | 无 | 只关闭自动更新，保留手动 `/api/update` |
 
 ## 配置说明
 
@@ -125,6 +128,8 @@ curl "http://127.0.0.1:8080/api/parse?url=https://wwi.lanzou.com/xxxx&pwd=密码
   "auto_share": true,
   "share_pwd": "001",
   "allow_update": true,
+  "auto_update": true,
+  "auto_update_interval_min": 30,
   "github_token": "可选：ghp_xxx，仅用于避免 GitHub API 限流",
   "updated_at": "2026-11-15T09:00:00+08:00"
 }
@@ -141,6 +146,7 @@ curl "http://127.0.0.1:8080/api/parse?url=https://wwi.lanzou.com/xxxx&pwd=密码
 - 状态卡显示 UID / VIP / 上传上限 / Cookie 摘要（不含原文）
 - 上传前按服务端返回的上限做预检，超限直接提示，避免白传
 - 重命名按钮会显示本次走的是「蓝奏原生」还是「回退重传」
+- v1.3 设置页「检查更新」卡可开关自动更新、设置检查间隔、手动立即更新
 - v1.2 设置页新增「VIP 状态」卡（立即检测 / 显示 VIP 几、到期时间、剩余天数、当前机制、按等级设上限）和「检查更新」卡（检查 + 一键更新）
 - PHP 侧限制：`php.ini` 的 `upload_max_filesize` / `post_max_size` 必须大于你要传的文件，否则 PHP 会先拒绝（面板会明确提示这两个值）
 
@@ -156,6 +162,13 @@ GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o lanzou-server-amd64 main.go
 # Linux arm64（ARM 服务器 / Termux）
 GOOS=linux GOARCH=arm64 go build -ldflags "-s -w" -o lanzou-server-arm64 main.go
 ```
+
+## 自动更新说明
+
+- 启动后 8 秒检查一次，命中新版本就下载对应 `lanzougo-<os>-<arch>` 资产 → sha256 校验 → 覆盖自身二进制 → 1.5 秒后重启（同参数同工作目录）。
+- Windows 无法覆盖运行中的 exe，会自动落到 `*.new` 并提示手动替换；Linux/macOS 可直接热替换。
+- 用 systemd / Docker 托管时，程序重启即重新拉起（Docker 需 `restart: always`）；也可依赖服务管理器在进程退出后重启。
+- Release 资产由 `.github/workflows/release.yml` 在打 `v*` tag 时自动构建上传。
 
 ## 安全说明
 

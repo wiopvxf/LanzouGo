@@ -44,7 +44,7 @@ import (
 	"unicode/utf8"
 )
 
-const version = "1.2.0"
+const version = "1.3.0"
 
 const (
 	repoOwner = "wiopvxf"
@@ -54,7 +54,8 @@ const (
 	apiUpHost   = "https://up.woozooo.com"
 	accountsURL = "https://accounts.woozooo.com/accounts.php?action=login&ref=up.woozooo.com"
 
-	defaultMaxUploadMB = 100
+	defaultMaxUploadMB           = 100
+	defaultAutoUpdateIntervalMin = 30
 )
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -280,32 +281,41 @@ func doReq(makeReq func(cookie string) (*http.Request, error), cookie string) ([
 // ======================================================================
 
 type Config struct {
-	Username     string         `json:"username,omitempty"`
-	PasswordEnc  string         `json:"password_enc,omitempty"` // AES-GCM 加密后的密码
-	Cookie       string         `json:"cookie,omitempty"`
-	Valid        bool           `json:"valid"`
-	UID          string         `json:"uid,omitempty"`
-	VIP          bool           `json:"vip"` // Cookie 检测结果
-	VIPLevel     int            `json:"vip_level,omitempty"`
-	VIPExpire    string         `json:"vip_expire,omitempty"`
-	VIPCheckedAt string         `json:"vip_checked_at,omitempty"`
-	RenameMode   int            `json:"rename_mode"`            // 1=原生重命名(VIP) 0=下载改名上传(非VIP)
-	MaxUploadMB  int            `json:"max_upload_mb"`          // VIP 默认上限，非 VIP 固定 100
-	LevelLimits  map[string]int `json:"level_limits,omitempty"` // 按 VIP 等级定制上限，如 {"1":200,"2":500}
-	AutoShare    bool           `json:"auto_share"`             // 上传后是否自动开启分享
-	SharePwd     string         `json:"share_pwd"`              // 自动分享使用的提取码
-	BlockedExt   []string       `json:"blocked_ext,omitempty"`  // 追加“不支持后缀”，命中后上传名会加 (c).zip
-	AllowUpdate  bool           `json:"allow_update"`           // 是否允许 /api/update 自更新
-	GitHubToken  string         `json:"github_token,omitempty"` // 可选：GitHub Token，避免 API 限流
-	Token        string         `json:"token,omitempty"`        // 访问令牌，为空则不校验
-	UpdatedAt    string         `json:"updated_at,omitempty"`
+	Username              string         `json:"username,omitempty"`
+	PasswordEnc           string         `json:"password_enc,omitempty"` // AES-GCM 加密后的密码
+	Cookie                string         `json:"cookie,omitempty"`
+	Valid                 bool           `json:"valid"`
+	UID                   string         `json:"uid,omitempty"`
+	VIP                   bool           `json:"vip"` // Cookie 检测结果
+	VIPLevel              int            `json:"vip_level,omitempty"`
+	VIPExpire             string         `json:"vip_expire,omitempty"`
+	VIPCheckedAt          string         `json:"vip_checked_at,omitempty"`
+	RenameMode            int            `json:"rename_mode"`                        // 1=原生重命名(VIP) 0=下载改名上传(非VIP)
+	MaxUploadMB           int            `json:"max_upload_mb"`                      // VIP 默认上限，非 VIP 固定 100
+	LevelLimits           map[string]int `json:"level_limits,omitempty"`             // 按 VIP 等级定制上限，如 {"1":200,"2":500}
+	AutoShare             bool           `json:"auto_share"`                         // 上传后是否自动开启分享
+	SharePwd              string         `json:"share_pwd"`                          // 自动分享使用的提取码
+	BlockedExt            []string       `json:"blocked_ext,omitempty"`              // 追加“不支持后缀”，命中后上传名会加 (c).zip
+	AllowUpdate           bool           `json:"allow_update"`                       // 是否允许自更新（总开关）
+	AutoUpdate            bool           `json:"auto_update"`                        // 自动更新：发现新版本立刻下载替换并重启，默认开
+	AutoUpdateIntervalMin int            `json:"auto_update_interval_min,omitempty"` // 自动检查间隔（分钟），默认 30
+	GitHubToken           string         `json:"github_token,omitempty"`             // 可选：GitHub Token，避免 API 限流
+	Token                 string         `json:"token,omitempty"`                    // 访问令牌，为空则不校验
+	UpdatedAt             string         `json:"updated_at,omitempty"`
 }
 
 var (
 	cfgPath = "lanzou.json"
 	keyPath = "lanzou.key"
 	cfgMu   sync.RWMutex
-	conf    = Config{MaxUploadMB: defaultMaxUploadMB, AutoShare: true, SharePwd: "001", AllowUpdate: true}
+	conf    = Config{
+		MaxUploadMB:           defaultMaxUploadMB,
+		AutoShare:             true,
+		SharePwd:              "001",
+		AllowUpdate:           true,
+		AutoUpdate:            true,
+		AutoUpdateIntervalMin: defaultAutoUpdateIntervalMin,
+	}
 )
 
 func cfgGet() Config {
@@ -1948,22 +1958,24 @@ func apiStatus(w http.ResponseWriter, r *http.Request) {
 		return l, e, d
 	}()
 	payload := map[string]interface{}{
-		"version":         version,
-		"valid":           valid && cookie != "",
-		"username":        cfg.Username,
-		"uid":             firstNonEmpty(uid, cfg.UID),
-		"vip":             vip,
-		"vip_level":       vLevel,
-		"vip_expire":      vExpire,
-		"vip_expire_days": vDays,
-		"vip_checked_at":  cfg.VIPCheckedAt,
-		"rename_mode":     sess.renameMode(),
-		"upload_limit_mb": sess.effectiveLimitMB(),
-		"auto_share":      cfg.AutoShare,
-		"updated_at":      firstNonEmpty(cfg.UpdatedAt, ""),
-		"has_password":    cfg.PasswordEnc != "",
-		"cookie_masked":   maskToken(cookie),
-		"allow_update":    cfg.AllowUpdate,
+		"version":                  version,
+		"valid":                    valid && cookie != "",
+		"username":                 cfg.Username,
+		"uid":                      firstNonEmpty(uid, cfg.UID),
+		"vip":                      vip,
+		"vip_level":                vLevel,
+		"vip_expire":               vExpire,
+		"vip_expire_days":          vDays,
+		"vip_checked_at":           cfg.VIPCheckedAt,
+		"rename_mode":              sess.renameMode(),
+		"upload_limit_mb":          sess.effectiveLimitMB(),
+		"auto_share":               cfg.AutoShare,
+		"updated_at":               firstNonEmpty(cfg.UpdatedAt, ""),
+		"has_password":             cfg.PasswordEnc != "",
+		"cookie_masked":            maskToken(cookie),
+		"allow_update":             cfg.AllowUpdate,
+		"auto_update":              cfg.AutoUpdate,
+		"auto_update_interval_min": cfg.AutoUpdateIntervalMin,
 	}
 	sess.mu.RLock()
 	payload["last_error"] = sess.lastErr
@@ -2116,14 +2128,17 @@ func apiLimits(w http.ResponseWriter, r *http.Request) {
 	}()
 	if r.Method == "GET" {
 		respOK(w, "ok", map[string]interface{}{
-			"vip":                vip,
-			"vip_level":          level,
-			"rename_mode":        sess.renameMode(),
-			"max_upload_mb":      cfg.MaxUploadMB,
-			"level_limits":       cfg.LevelLimits,
-			"effective_limit_mb": sess.effectiveLimitMB(),
-			"default_limit_mb":   defaultMaxUploadMB,
-			"note":               "非 VIP 单文件固定 100MB；VIP 可用 max_upload_mb 或按等级 level_limits（如 1=200,2=500）调整",
+			"vip":                      vip,
+			"vip_level":                level,
+			"rename_mode":              sess.renameMode(),
+			"max_upload_mb":            cfg.MaxUploadMB,
+			"level_limits":             cfg.LevelLimits,
+			"allow_update":             cfg.AllowUpdate,
+			"auto_update":              cfg.AutoUpdate,
+			"auto_update_interval_min": cfg.AutoUpdateIntervalMin,
+			"effective_limit_mb":       sess.effectiveLimitMB(),
+			"default_limit_mb":         defaultMaxUploadMB,
+			"note":                     "非 VIP 单文件固定 100MB；VIP 可用 max_upload_mb 或按等级 level_limits（如 1=200,2=500）调整",
 		})
 		return
 	}
@@ -2225,6 +2240,26 @@ func apiLimits(w http.ResponseWriter, r *http.Request) {
 		}
 		updated = true
 	}
+	if v := r.PostFormValue("auto_update"); v != "" {
+		b := v == "1" || strings.EqualFold(v, "true")
+		if err := cfgUpdate(func(c *Config) { c.AutoUpdate = b }); err != nil {
+			respErr(w, 500, "写入配置失败："+err.Error())
+			return
+		}
+		updated = true
+	}
+	if v := r.PostFormValue("auto_update_interval_min"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 1440 {
+			respErr(w, 400, "auto_update_interval_min 必须是 1-1440 的整数")
+			return
+		}
+		if err := cfgUpdate(func(c *Config) { c.AutoUpdateIntervalMin = n }); err != nil {
+			respErr(w, 500, "写入配置失败："+err.Error())
+			return
+		}
+		updated = true
+	}
 	if v := r.PostFormValue("allow_update"); v != "" {
 		b := v == "1" || strings.EqualFold(v, "true")
 		if err := cfgUpdate(func(c *Config) { c.AllowUpdate = b }); err != nil {
@@ -2238,14 +2273,16 @@ func apiLimits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respOK(w, "已更新", map[string]interface{}{
-		"vip":                sess.isVIP(),
-		"vip_level":          cfgGet().VIPLevel,
-		"rename_mode":        sess.renameMode(),
-		"max_upload_mb":      cfgGet().MaxUploadMB,
-		"level_limits":       cfgGet().LevelLimits,
-		"effective_limit_mb": sess.effectiveLimitMB(),
-		"auto_share":         cfgGet().AutoShare,
-		"allow_update":       cfgGet().AllowUpdate,
+		"vip":                      sess.isVIP(),
+		"vip_level":                cfgGet().VIPLevel,
+		"rename_mode":              sess.renameMode(),
+		"max_upload_mb":            cfgGet().MaxUploadMB,
+		"level_limits":             cfgGet().LevelLimits,
+		"effective_limit_mb":       sess.effectiveLimitMB(),
+		"auto_share":               cfgGet().AutoShare,
+		"allow_update":             cfgGet().AllowUpdate,
+		"auto_update":              cfgGet().AutoUpdate,
+		"auto_update_interval_min": cfgGet().AutoUpdateIntervalMin,
 	})
 }
 
@@ -2839,6 +2876,77 @@ func restartSelf() error {
 	return nil
 }
 
+// autoUpdateOnce 检查一次并立即更新；返回 true 表示已替换二进制、正在重启
+func autoUpdateOnce() bool {
+	cfg := cfgGet()
+	if !cfg.AllowUpdate || !cfg.AutoUpdate {
+		return false
+	}
+	rel, err := fetchLatestRelease()
+	if err != nil {
+		fmt.Printf("[update] 检查更新失败：%v\n", err)
+		return false
+	}
+	if !versionNewer(version, rel.TagName) {
+		return false
+	}
+	a := pickAsset(rel)
+	if a == nil {
+		fmt.Printf("[update] 最新版本 %s 没有适配 %s-%s 的二进制，跳过自动更新\n", rel.TagName, runtime.GOOS, runtime.GOARCH)
+		return false
+	}
+	fmt.Printf("[update] 发现新版本 %s，开始下载 %s（%.1fMB）\n", rel.TagName, a.Name, float64(a.Size)/1048576)
+	data, err := downloadAsset(a)
+	if err != nil {
+		fmt.Printf("[update] 下载失败：%v\n", err)
+		return false
+	}
+	exe, _, err := applyUpdate(data)
+	if err != nil {
+		fmt.Printf("[update] 替换二进制失败：%v\n", err)
+		return false
+	}
+	fmt.Printf("[update] 已更新 %s → %s（%s），1.5 秒后自动重启\n", version, rel.TagName, exe)
+	go func() {
+		time.Sleep(1500 * time.Millisecond)
+		if err := restartSelf(); err != nil {
+			fmt.Printf("[update] 自动重启失败（%v），请手动重启服务；新版本已在磁盘上\n", err)
+		}
+	}()
+	return true
+}
+
+// startAutoUpdater 启动后台自动更新（启动 8 秒后先查一次，之后按配置间隔轮询）
+func startAutoUpdater() {
+	cfg := cfgGet()
+	if !cfg.AllowUpdate {
+		fmt.Println("[update] 自更新已被 allow_update=false 关闭")
+		return
+	}
+	if !cfg.AutoUpdate {
+		fmt.Println("[update] 自动更新已关闭（auto_update=false），仅支持手动检查")
+		return
+	}
+	iv := cfg.AutoUpdateIntervalMin
+	if iv <= 0 {
+		iv = defaultAutoUpdateIntervalMin
+	}
+	fmt.Printf("[update] 自动更新已启用：启动后检查一次，之后每 %d 分钟检查一次\n", iv)
+	go func() {
+		time.Sleep(8 * time.Second)
+		for {
+			if autoUpdateOnce() {
+				return
+			}
+			iv = cfgGet().AutoUpdateIntervalMin
+			if iv <= 0 {
+				iv = defaultAutoUpdateIntervalMin
+			}
+			time.Sleep(time.Duration(iv) * time.Minute)
+		}
+	}()
+}
+
 func apiVersion(w http.ResponseWriter, r *http.Request) {
 	info, err := buildUpdateInfo()
 	if err != nil {
@@ -2985,6 +3093,7 @@ func main() {
 	checkUpdateFlag := false
 	updateFlag := false
 	noUpdate := false
+	noAutoUpdate := false
 
 	for i, a := range os.Args {
 		switch a {
@@ -3014,6 +3123,8 @@ func main() {
 			updateFlag = true
 		case "-no-update":
 			noUpdate = true
+		case "-no-auto-update":
+			noAutoUpdate = true
 		case "-maxupload":
 			if i+1 < len(os.Args) {
 				if n, err := strconv.Atoi(os.Args[i+1]); err == nil && n > 0 {
@@ -3042,7 +3153,10 @@ func main() {
 		})
 	}
 	if noUpdate {
-		_ = cfgUpdate(func(c *Config) { c.AllowUpdate = false })
+		_ = cfgUpdate(func(c *Config) { c.AllowUpdate = false; c.AutoUpdate = false })
+	}
+	if noAutoUpdate {
+		_ = cfgUpdate(func(c *Config) { c.AutoUpdate = false })
 	}
 
 	if checkUpdateFlag || updateFlag {
@@ -3134,6 +3248,7 @@ func main() {
 	_, _, _, vip, valid := sess.snapshot()
 	fmt.Printf("LanzouGo v%s 启动：监听 %s:%s（%s），账号状态：%v，VIP：%v，上传上限：%dMB\n",
 		version, listen, port, cfgPath, valid, vip, sess.effectiveLimitMB())
+	startAutoUpdater()
 	if err := http.ListenAndServe(listen+":"+port, handler); err != nil {
 		fmt.Printf("服务启动失败：%v\n", err)
 	}
