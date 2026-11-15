@@ -1,5 +1,8 @@
-# 运行时配置（含 Cookie，切勿提交）
+# 运行时配置（含 Cookie / 加密密码，切勿提交）
 lanzou.json
+lanzou.json.tmp
+lanzou.key
+*.key
 *.log
 
 # 编译产物
@@ -7,3 +10,6 @@ lanzou-server
 lanzou-server-amd64
 lanzou-server-arm64
 *.exe
+
+# 发布产物
+dist/

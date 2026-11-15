@@ -1,15 +1,50 @@
 <?php
 /**
- * lanzou-test.php v3 — 蓝奏云(LanzouGo)文件管理面板
+ * lanzou-test.php v5 — 蓝奏云(LanzouGo)文件管理面板（v1.2：VIP 检测 / 等级上限 / 检查更新）
  * 底部导航三 Tab：文件列表 / 分享 / 设置
  * 后端透传本机 LanzouGo 服务 http://127.0.0.1:8080
- * 纯原生 PHP + curl，无外部依赖。测试用，可随时删除。
+ *
+ * v4 变更（配合 LanzouGo v1.1）：
+ *   1. 设置页支持「账号 + 密码」登录，登录后由服务端自动获取并维护 Cookie，面板不再需要手填 Cookie
+ *   2. 状态展示 UID / VIP / 上传上限 / Cookie 摘要（仅 sha256 前 8 位），**不回显 Cookie 原文**
+ *   3. 上传限制：非 VIP 单文件 100MB，VIP 由 /api/limits 调整；超限在面板直接提示
+ *   4. 重命名优先走蓝奏原生重命名，失败自动回退「下载→改名上传→删原」，并保留提取码
+ *   5. 下载代理严格校验蓝奏域名后缀（不再用子串匹配），并强制 attachment 下载
+ *
+ * 纯原生 PHP + curl，无外部依赖。
  */
 error_reporting(0);
 ini_set('display_errors', '0');
 header('Content-Type: text/html; charset=utf-8');
 
 $API = 'http://127.0.0.1:8080';
+
+/* 允许的蓝奏域名后缀（下载代理与前端链接校验用） */
+function lzHostOk($raw)
+{
+    $host = strtolower((string)parse_url($raw, PHP_URL_HOST));
+    if ($host === '') return false;
+    $scheme = strtolower((string)parse_url($raw, PHP_URL_SCHEME));
+    if ($scheme !== 'http' && $scheme !== 'https') return false;
+    static $suffix = [
+        '.woozooo.com', '.lanzou.com', '.lanzoua.com', '.lanzoub.com', '.lanzouc.com',
+        '.lanzoud.com', '.lanzoue.com', '.lanzouf.com', '.lanzoug.com', '.lanzouh.com',
+        '.lanzoui.com', '.lanzouj.com', '.lanzouk.com', '.lanzoul.com', '.lanzoum.com',
+        '.lanzoup.com', '.lanzouq.com', '.lanzous.com', '.lanzout.com', '.lanzouu.com',
+        '.lanzouv.com', '.lanzouw.com', '.lanzouy.com', '.lanzouz.com',
+        '.lanzn.com', '.lanrar.com', '.webgetstore.com',
+    ];
+    foreach ($suffix as $s) {
+        if ($host === substr($s, 1) || substr($host, -strlen($s)) === $s) return true;
+    }
+    return false;
+}
+
+function jsend($data)
+{
+    echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
+}
 
 function apiReq($url, $post = null, $timeout = 180)
 {
@@ -38,65 +73,140 @@ if ($ajax !== '') {
 
     if ($ajax === 'list') {
         $folder = isset($_GET['folder']) ? trim($_GET['folder']) : '0';
-        echo json_encode(apiReq($API . '/api/list?folder=' . urlencode($folder), null, 60), JSON_UNESCAPED_UNICODE);
+        $r = apiReq($API . '/api/list?folder=' . urlencode($folder), null, 60);
+        echo json_encode($r, JSON_UNESCAPED_UNICODE);
         exit;
     }
     if ($ajax === 'mkdir') {
-        echo json_encode(apiReq($API . '/api/mkdir', ['name' => $_POST['name'] ?? '', 'folder' => $_POST['folder'] ?? '0']), JSON_UNESCAPED_UNICODE);
-        exit;
+        jsend(apiReq($API . '/api/mkdir', ['name' => $_POST['name'] ?? '', 'parent' => $_POST['folder'] ?? '0']));
     }
     if ($ajax === 'delete') {
-        echo json_encode(apiReq($API . '/api/delete', ['id' => $_POST['id'] ?? '', 'type' => $_POST['type'] ?? 'file']), JSON_UNESCAPED_UNICODE);
-        exit;
+        jsend(apiReq($API . '/api/delete', ['id' => $_POST['id'] ?? '', 'type' => $_POST['type'] ?? 'file']));
     }
     if ($ajax === 'share') {
-        echo json_encode(apiReq($API . '/api/share', ['id' => $_POST['id'] ?? '', 'type' => $_POST['type'] ?? 'file', 'pwd' => $_POST['pwd'] ?? '']), JSON_UNESCAPED_UNICODE);
-        exit;
+        jsend(apiReq($API . '/api/share', [
+            'file_id'   => $_POST['id'] ?? '',
+            'type'      => $_POST['type'] ?? 'file',
+            'pwd'       => $_POST['pwd'] ?? '',
+        ]));
     }
     if ($ajax === 'parse') {
-        echo json_encode(apiReq($API . '/api/parse?url=' . urlencode($_POST['url'] ?? '') . '&pwd=' . urlencode($_POST['pwd'] ?? ''), null, 60), JSON_UNESCAPED_UNICODE);
-        exit;
+        jsend(apiReq($API . '/api/parse?url=' . urlencode($_POST['url'] ?? '') . '&pwd=' . urlencode($_POST['pwd'] ?? ''), null, 60));
     }
+    /* 重命名：服务端优先蓝奏原生重命名，失败回退「下载→改名上传→删原」 */
     if ($ajax === 'rename') {
-        echo json_encode(apiReq($API . '/api/rename', ['id' => $_POST['id'] ?? '', 'newname' => $_POST['newname'] ?? '', 'folder' => $_POST['folder'] ?? '0'], 300), JSON_UNESCAPED_UNICODE);
-        exit;
+        jsend(apiReq($API . '/api/rename', [
+            'file_id' => $_POST['id'] ?? '',
+            'name'    => $_POST['newname'] ?? '',
+            'folder'  => $_POST['folder'] ?? '0',
+        ], 600));
+    }
+    if ($ajax === 'rename_folder') {
+        jsend(apiReq($API . '/api/rename_folder', [
+            'folder_id' => $_POST['id'] ?? '',
+            'name'      => $_POST['newname'] ?? '',
+            'parent'    => $_POST['folder'] ?? '0',
+        ], 120));
     }
     if ($ajax === 'save') {
-        echo json_encode(apiReq($API . '/api/save', ['url' => $_POST['url'] ?? '', 'pwd' => $_POST['pwd'] ?? '', 'folder' => $_POST['folder'] ?? '0'], 600), JSON_UNESCAPED_UNICODE);
-        exit;
+        jsend(apiReq($API . '/api/save', [
+            'url'    => $_POST['url'] ?? '',
+            'pwd'    => $_POST['pwd'] ?? '',
+            'folder' => $_POST['folder'] ?? '0',
+        ], 600));
     }
     if ($ajax === 'status') {
-        echo json_encode(apiReq($API . '/api/status'), JSON_UNESCAPED_UNICODE);
-        exit;
+        jsend(apiReq($API . '/api/status'));
+    }
+    if ($ajax === 'account') {
+        jsend(apiReq($API . '/api/account'));
+    }
+    /* 账号登录：密码只向后端转发，面板不落地、不存 Cookie */
+    if ($ajax === 'login') {
+        $user = trim($_POST['username'] ?? '');
+        $pass = (string)($_POST['password'] ?? '');
+        if ($user === '' || $pass === '') {
+            jsend(['code' => 400, 'msg' => '请填写账号和密码']);
+        }
+        $r = apiReq($API . '/api/login', ['username' => $user, 'password' => $pass], 120);
+        if (isset($r['code']) && (int)$r['code'] === 401) {
+            $r['msg'] = '账号登录失败';
+        }
+        jsend($r);
+    }
+    if ($ajax === 'logout') {
+        jsend(apiReq($API . '/api/logout', []));
+    }
+    if ($ajax === 'limits') {
+        if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+            jsend(apiReq($API . '/api/limits', [
+                'max_upload_mb' => $_POST['max_upload_mb'] ?? '',
+                'level_limits'  => $_POST['level_limits'] ?? '',
+                'vip_level'     => $_POST['vip_level'] ?? '',
+                'allow_update'  => $_POST['allow_update'] ?? '',
+                'auto_share'    => $_POST['auto_share'] ?? '',
+                'share_pwd'     => $_POST['share_pwd'] ?? '',
+            ]));
+        }
+        jsend(apiReq($API . '/api/limits'));
+    }
+    /* VIP 检测：强制刷新 Cookie 并解析 VIP 等级/到期时间 */
+    if ($ajax === 'check_vip') {
+        jsend(apiReq($API . '/api/check_vip', [], 60));
+    }
+    /* 检查更新：对比 GitHub Release */
+    if ($ajax === 'version') {
+        jsend(apiReq($API . '/api/version', null, 30));
+    }
+    if ($ajax === 'update') {
+        if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+            jsend(['code' => 405, 'msg' => '请使用 POST']);
+        }
+        jsend(apiReq($API . '/api/update', ['confirm' => '1'], 300));
     }
     if ($ajax === 'cookie') {
         $cookie = $_POST['cookie'] ?? '';
-        echo json_encode(apiReq($API . '/api/cookie', ['cookie' => $cookie], 90), JSON_UNESCAPED_UNICODE);
-        exit;
+        jsend(apiReq($API . '/api/cookie', ['cookie' => $cookie], 90));
     }
     if ($ajax === 'upload') {
-        if (!isset($_FILES['file']) || $_FILES['file']['error'] !== UPLOAD_ERR_OK) {
-            echo json_encode(['code' => -1, 'msg' => '未收到文件或上传被中断'], JSON_UNESCAPED_UNICODE);
-            exit;
+        $f = $_FILES['file'] ?? null;
+        if (!is_array($f) || ($f['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+            $code = is_array($f) ? (int)$f['error'] : UPLOAD_ERR_NO_FILE;
+            $msg  = '未收到文件或上传被中断';
+            if ($code === UPLOAD_ERR_INI_SIZE || $code === UPLOAD_ERR_FORM_SIZE) {
+                $msg = '文件超过 PHP 配置上限（upload_max_filesize=' . ini_get('upload_max_filesize')
+                     . '，post_max_size=' . ini_get('post_max_size') . '），请调大 php.ini 后重试';
+            }
+            jsend(['code' => 413, 'msg' => $msg]);
         }
-        $upName = $_FILES['file']['name'];
+        $upName = (string)$f['name'];
+        $base   = str_replace(['/', '\\'], '_', basename($upName));
+        $size   = (int)($f['size'] ?? 0);
+
+        /* 先按服务端返回的上传上限做预检，避免白传大文件 */
+        $limits = apiReq($API . '/api/limits', null, 10);
+        $limitMB = (int)($limits['data']['effective_limit_mb'] ?? 0);
+        $isVip   = !empty($limits['data']['vip']);
+        if ($limitMB > 0 && $size > $limitMB * 1024 * 1024) {
+            jsend([
+                'code' => 413,
+                'msg'  => sprintf('文件 %.1fMB 超过上限 %dMB（%s）', $size / 1048576, $limitMB, $isVip ? 'VIP 可调' : '非 VIP 固定 100MB'),
+            ]);
+        }
+
         $safeDir = '/tmp/lzweb_' . bin2hex(random_bytes(6));
         if (!@mkdir($safeDir, 0700)) {
-            echo json_encode(['code' => -1, 'msg' => '临时目录创建失败'], JSON_UNESCAPED_UNICODE);
-            exit;
+            jsend(['code' => -1, 'msg' => '临时目录创建失败']);
         }
-        $safe = $safeDir . '/' . preg_replace('/[\/\\\\]/', '_', $upName);
-        if (!move_uploaded_file($_FILES['file']['tmp_name'], $safe)) {
+        $safe = $safeDir . '/' . $base;
+        if (!move_uploaded_file($f['tmp_name'], $safe)) {
             @rmdir($safeDir);
-            echo json_encode(['code' => -1, 'msg' => '临时文件写入失败'], JSON_UNESCAPED_UNICODE);
-            exit;
+            jsend(['code' => -1, 'msg' => '临时文件写入失败']);
         }
-        $folder = $_POST['folder'] ?? '0';
-        $r = apiReq($API . '/api/upload', ['path' => $safe, 'folder' => $folder], 300);
+        $r = apiReq($API . '/api/upload', ['path' => $safe, 'folder' => $_POST['folder'] ?? '0'], 600);
         @unlink($safe);
         @rmdir($safeDir);
-        echo json_encode($r, JSON_UNESCAPED_UNICODE);
-        exit;
+        jsend($r);
     }
     echo json_encode(['code' => 400, 'msg' => '未知ajax动作']);
     exit;
@@ -111,19 +221,19 @@ if ($dl !== '') {
     $u = $_GET['u'] ?? '';
     $name = $_GET['name'] ?? 'download';
     if ($u === '') { http_response_code(400); exit('missing url'); }
-    $host = strtolower((string)parse_url($u, PHP_URL_HOST));
-    if ($host === '' || (strpos($host, 'lanrar.com') === false && strpos($host, 'lanzou') === false && strpos($host, 'webgetstore') === false)) {
+    /* 严格后缀白名单，避免 host 子串绕过（如 lanzou.attacker.com） */
+    if (!lzHostOk($u)) {
         http_response_code(400); exit('bad url');
     }
+    $name = preg_replace('/[^\w\.\-\(\)\[\] ]+/u', '_', $name);
+    if ($name === '' || $name === null) { $name = 'download'; }
     header('Content-Type: application/octet-stream');
     header('Content-Disposition: attachment; filename="download"; filename*=UTF-8\'\'' . rawurlencode($name));
     header('X-Accel-Buffering: no');
     $ch = curl_init($API . '/api/download?url=' . rawurlencode($u));
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 300);
-    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 600);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, false);
     curl_exec($ch);
     curl_close($ch);
     exit;
@@ -376,13 +486,39 @@ tbody tr:last-child td{border-bottom:none}
   <!-- ========== Tab3 设置 ========== -->
   <div class="view" id="view-settings">
     <div class="card">
-      <div class="t"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>当前 Cookie 状态</div>
+      <div class="t"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>账号状态</div>
       <div id="statusBox" class="dval">加载中…</div>
     </div>
     <div class="card">
-      <div class="t"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>配置 Cookie（自动检测可用性，有效才保存；失效则沿用之前的）</div>
-      <textarea id="cookieInput" rows="4" style="width:100%;background:rgba(9,15,27,.8);border:1px solid var(--line);color:var(--txt);border-radius:11px;padding:10px;font-size:12px;font-family:var(--font-m);resize:vertical" placeholder="粘贴完整 Cookie，例如：phpdisk_info=xxx; PHPSESSID=xxx; ..." aria-label="Cookie" autocomplete="off" spellcheck="false"></textarea>
-      <div class="inrow" style="margin-top:10px"><button style="flex:1" onclick="saveCookie()">保存并检测</button></div>
+      <div class="t"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>账号登录（登录后自动获取 Cookies，失效自动重登）</div>
+      <div class="inrow"><input type="text" id="loginUser" placeholder="蓝奏云账号（手机号 / 邮箱）" autocomplete="username" aria-label="账号" /></div>
+      <div class="inrow"><input type="password" id="loginPass" placeholder="密码" autocomplete="current-password" aria-label="密码" /></div>
+      <div class="inrow"><button type="button" style="flex:1" onclick="doLogin()">登录</button><button type="button" class="btn gray" style="flex:0 0 88px" onclick="doLogout()">退出</button></div>
+      <div style="font-size:11.5px;color:var(--weak);margin-top:9px;line-height:1.6">密码由服务端 AES-GCM 加密后写入 0600 配置文件，仅用于 Cookie 失效时自动重登；任何接口都不会返回 Cookie 原文。</div>
+    </div>
+    <div class="card">
+      <div class="t"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>上传限制</div>
+      <div class="inrow"><input type="number" id="maxUpMB" placeholder="VIP 专属：单文件上限（MB）" min="100" step="10" aria-label="上传上限" /></div>
+      <div class="inrow"><button type="button" style="flex:1" onclick="saveLimits()">保存上限</button><button type="button" class="btn gray" style="flex:0 0 118px" id="autoShareBtn" onclick="toggleAutoShare()">自动分享：开</button></div>
+      <div style="font-size:11.5px;color:var(--weak);margin-top:9px;line-height:1.6">非 VIP 单文件固定 100MB；VIP 账号可调（不低于 100MB）。超限时上传会直接报错，不会白传。</div>
+    </div>
+    <div class="card">
+      <div class="t"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 2l2.4 6.9H22l-5.8 4.3 2.2 6.8-6.4-4.4-6.4 4.4 2.2-6.8L2 8.9h7.6z"/></svg>VIP 状态（Cookie 自动检测）</div>
+      <div id="vipBox" class="dval">尚未检测</div>
+      <div class="inrow" style="margin-top:9px"><input type="text" id="levelLimits" placeholder="按等级设上限，如 1=200,2=500" autocomplete="off" aria-label="等级上限" /></div>
+      <div class="inrow"><button type="button" style="flex:1" onclick="checkVip()">立即检测</button><button type="button" class="btn gray" style="flex:0 0 118px" onclick="saveLevelLimits()">保存等级上限</button></div>
+      <div style="font-size:11.5px;color:var(--weak);margin-top:9px;line-height:1.6">VIP 时重命名走蓝奏原生接口（机制 1）；非 VIP 走「下载→改名上传→删原」（机制 0），失败都会自动回退。</div>
+    </div>
+    <div class="card">
+      <div class="t"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg>检查更新</div>
+      <div id="verBox" class="dval">尚未检查</div>
+      <div class="inrow" style="margin-top:9px"><button type="button" style="flex:1" onclick="checkUpdate()">检查更新</button><button type="button" class="btn gray" style="flex:0 0 118px" onclick="doUpdate()">一键更新</button></div>
+      <div style="font-size:11.5px;color:var(--weak);margin-top:9px;line-height:1.6">对比 GitHub Release 最新版本；更新会替换程序并自动重启。GitHub API 限流时可在 lanzou.json 配置 github_token。</div>
+    </div>
+    <div class="card">
+      <div class="t"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>高级：手动写入 Cookie（一般不需要）</div>
+      <textarea id="cookieInput" rows="3" style="width:100%;background:rgba(9,15,27,.8);border:1px solid var(--line);color:var(--txt);border-radius:11px;padding:10px;font-size:12px;font-family:var(--font-m);resize:vertical" placeholder="粘贴完整 Cookie，例如：phpdisk_info=xxx; PHPSESSID=xxx; …" aria-label="Cookie" autocomplete="off" spellcheck="false"></textarea>
+      <div class="inrow" style="margin-top:10px"><button type="button" style="flex:1" onclick="saveCookie()">保存并检测</button></div>
     </div>
   </div>
 </div>
@@ -458,7 +594,11 @@ function loadList(f) {
   fetch('/lanzou-test.php?ajax=list&folder=' + encodeURIComponent(folder))
     .then(r => r.json())
     .then(j => {
-      if (j.code !== 0) { toast('获取列表失败：' + (j.msg || ''), 'err'); return; }
+      if (j.code !== 0) {
+        if (j.code === 401) { toast('账号登录失败' + (j.detail ? '：' + j.detail : ''), 'err'); switchTab('settings'); return; }
+        toast('获取列表失败：' + (j.msg || ''), 'err');
+        return;
+      }
       fileList = (j.data && j.data.list) || [];
       renderList();
     })
@@ -517,6 +657,12 @@ document.getElementById('fileInput').addEventListener('change', function() {
 });
 
 function startUpload(file) {
+  const limitMB = Number(window._limitMB || 100);
+  if (file.size > limitMB * 1024 * 1024) {
+    toast('文件 ' + (file.size / 1048576).toFixed(1) + 'MB 超过上传上限 ' + limitMB + 'MB'
+      + (window._vip ? '（VIP 可在设置页调整）' : '（非 VIP 单文件固定 100MB）'), 'err');
+    return;
+  }
   document.getElementById('upMask').classList.add('on');
   document.getElementById('upFileName').textContent = '文件上传：' + file.name;
   document.getElementById('upBarFill').style.width = '0%';
@@ -539,7 +685,13 @@ function startUpload(file) {
     try { j = JSON.parse(xhr.responseText); } catch (e) {}
     if (j.code === 0) {
       const d = j.data || {};
-      toast('上传成功：' + (d.name || file.name) + ' 提取码：' + (d.pwd || '001'), 'ok');
+      const pwd = d.share_pwd || '';
+      toast('上传成功：' + (d.name_all || file.name) + (pwd ? ' 提取码：' + pwd : ''), 'ok');
+    } else if (j.code === 401) {
+      toast('账号登录失败' + (j.detail ? '：' + j.detail : ''), 'err');
+      switchTab('settings');
+    } else if (j.code === 413) {
+      toast(j.msg || '文件超过上传上限', 'err');
     } else {
       toast('上传失败：' + (j.msg || xhr.responseText || '未知错误'), 'err');
     }
@@ -651,12 +803,33 @@ function doRename(id, oldName) {
   fd.append('id', id);
   fd.append('newname', n);
   fd.append('folder', folder);
+  toast('重命名中，若蓝奏原生接口不可用会自动改为重传…');
   fetch('/lanzou-test.php?ajax=rename', { method: 'POST', body: fd })
     .then(r => r.json())
     .then(j => {
-      if (j.code === 0) { closeDlg(); toast('重命名成功：' + n + '（已保留原提取码）', 'ok'); loadList(); }
+      if (j.code === 0) {
+        const d = j.data || {};
+        const how = d.method === 'native' ? '（蓝奏原生重命名）' : '（回退：下载→改名上传→删原，提取码已保留）';
+        closeDlg(); toast('重命名成功：' + n + how, 'ok'); loadList();
+      }
       else toast('重命名失败：' + (j.msg || '') + (j.detail ? ' ' + j.detail : ''), 'err');
     });
+}
+
+function doRenameFolder(id, parent) {
+  const n = document.getElementById('dNewDirName').value.trim();
+  if (!n) { toast('请输入新文件夹名', 'err'); return; }
+  const fd = new FormData();
+  fd.append('id', id);
+  fd.append('newname', n);
+  fd.append('folder', parent || '0');
+  fetch('/lanzou-test.php?ajax=rename_folder', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(j => {
+      if (j.code === 0) { closeDlg(); toast('重命名成功：' + n, 'ok'); loadList(); }
+      else toast('重命名失败：' + (j.msg || ''), 'err');
+    })
+    .catch(e => toast('请求失败', 'err'));
 }
 
 function dlFromDlg() {
@@ -705,6 +878,7 @@ function openDirDetail(id, nameEnc) {
     '<div class="dline">提取码：<b id="dPwd">加载中…</b></div>' +
     '<div class="dline">分享链接</div><div class="dval" id="dUrl">加载中…</div>' +
     '<div class="dline">更改提取码 <span style="color:#64748b;font-size:11px">（文件夹为会员功能，不可用）</span></div><div class="inrow small"><input type="text" id="dNewPwd" placeholder="新提取码" disabled aria-label="新提取码" /><button type="button" style="font-size:12px;padding:0 10px" disabled onclick="changePwd(winDlgId,\'folder\')">设置</button></div>' +
+    '<div class="dline">重命名</div><div class="inrow small"><input type="text" id="dNewDirName" placeholder="新文件夹名" autocomplete="off" aria-label="新文件夹名" /><button type="button" style="font-size:12px;padding:0 10px" onclick="doRenameFolder(winDlgId,winDlgParent)">重命名</button></div>' +
     '<div class="dacts">' +
     '<button type="button" style="background:#334155" onclick="copyShare()">复制链接</button>' +
     '<button type="button" style="background:linear-gradient(135deg,#dc2626,#ef4444)" onclick="delDlgDir(winDlgId)">删除</button>' +
@@ -712,6 +886,7 @@ function openDirDetail(id, nameEnc) {
   document.getElementById('dlgMask').classList.add('on');
   window.winDlgId = id;
   window.winDlgName = nameEnc;
+  window.winDlgParent = folder || '0';
   const fd = new FormData();
   fd.append('id', id);
   fd.append('type', 'folder');
@@ -783,10 +958,11 @@ function renderShare() {
     return;
   }
   if (shareData.type === 'folder') {
-    const files = (shareData.files || []).filter(f => !kw || (f.name || '').toLowerCase().includes(kw));
+    const all = (shareData.files || shareData.list || []);
+    const files = all.filter(f => !kw || (f.name_all || f.name || '').toLowerCase().includes(kw));
     const src = window._shareSrc || '';
     const pwd = window._sharePwd || '';
-    let html = '<div class="sres"><div class="sn">文件夹：' + escHtml(shareData.folder_name || '') + '（' + (shareData.files || []).length + ' 个文件）</div>' +
+    let html = '<div class="sres"><div class="sn">文件夹：' + escHtml(shareData.folder_name || '') + '（' + all.length + ' 个文件）</div>' +
       '<div class="sa"><button type="button" style="background:linear-gradient(135deg,#2563eb,#3b82f6)" onclick="openSaveSel(sfSrc2,sfPwd2,true)">全部转存</button>' +
       '<button type="button" style="background:#334155" onclick="copyText(sfSrc2)">复制链接</button></div></div>';
     window.sfSrc2 = src;
@@ -918,24 +1094,203 @@ function parseAndOpen(url, pwd) {
 function openUrl(u) { downloadViaProxy(u); }
 
 /* ============ 设置 ============ */
+window._limitMB = 100;
+window._vip = false;
+window._autoShare = true;
+
 function loadStatus() {
   fetch('/lanzou-test.php?ajax=status')
     .then(r => r.json())
     .then(j => {
       const d = j.data || {};
       const box = document.getElementById('statusBox');
-      if (j.code !== 0 || !d.valid) {
-        box.innerHTML = '状态：<span style="color:#fda4af">Cookie 无效</span><br />原因：' + escHtml(j.msg || d.detail || '未知');
-        return;
+      window._limitMB = Number(d.upload_limit_mb || 100);
+      window._vip = !!d.vip;
+      window._autoShare = d.auto_share !== false;
+      const btn = document.getElementById('autoShareBtn');
+      if (btn) btn.textContent = '自动分享：' + (window._autoShare ? '开' : '关');
+      const upInput = document.getElementById('maxUpMB');
+      if (upInput && document.activeElement !== upInput) upInput.value = d.max_upload_mb || '';
+
+      let html = '';
+      const badge = window._vip
+        ? '<span style="display:inline-block;padding:1px 7px;border-radius:6px;background:rgba(234,179,8,.16);color:#fbbf24;font-size:11px;margin-left:6px">VIP' + (d.vip_level ? d.vip_level : '') + '</span>'
+        : '<span style="display:inline-block;padding:1px 7px;border-radius:6px;background:rgba(148,163,184,.16);color:#94a3b8;font-size:11px;margin-left:6px">普通账号</span>';
+      if (d.valid) {
+        html += 'Cookie：<span style="color:#86efac">有效</span>' + badge;
+      } else {
+        html += 'Cookie：<span style="color:#fda4af">不可用</span>' + badge;
       }
-      let html = '状态：<span style="color:#86efac">有效</span>';
+      if (d.username) html += '<br />账号：' + escHtml(d.username);
       if (d.uid) html += '<br />UID：' + escHtml(d.uid);
+      html += '<br />重命名机制：' + (d.rename_mode === 1 ? '1（蓝奏原生重命名）' : '0（下载→改名上传→删原）');
+      html += '<br />上传上限：' + escHtml(String(window._limitMB)) + 'MB' +
+              (window._vip ? '（VIP 可调）' : '（非 VIP 固定）');
+      if (d.has_password) html += '<br />自动重登：<span style="color:#86efac">已启用</span>';
+      else html += '<br />自动重登：<span style="color:#eab308">未启用（需账号登录）</span>';
+      if (d.cookie_masked) html += '<br />Cookie 摘要：<span style="font-family:var(--font-m);font-size:11.5px">' + escHtml(d.cookie_masked) + '</span>';
       if (d.updated_at) html += '<br />更新时间：' + escHtml(d.updated_at);
-      if (d.cookie_preview) html += '<br />Cookie 摘要：' + escHtml(d.cookie_preview);
+      if (d.last_error) html += '<br /><span style="color:#fda4af">最近错误：' + escHtml(d.last_error) + '</span>';
       box.innerHTML = html;
+
+      const vb = document.getElementById('vipBox');
+      if (vb) {
+        let vh = window._vip
+          ? 'VIP 等级：<span style="color:#fbbf24">VIP' + (d.vip_level || '?') + '</span>'
+          : '当前为普通账号（非 VIP）';
+        if (d.vip_expire) {
+          vh += '<br />到期时间：' + escHtml(d.vip_expire) +
+                (typeof d.vip_expire_days === 'number' && d.vip_expire_days > 0 ? '（剩余 ' + d.vip_expire_days + ' 天）' : '');
+        }
+        vh += '<br />重命名机制：' + (d.rename_mode === 1 ? '1（原生）' : '0（回退）');
+        vh += '<br />当前上传上限：' + escHtml(String(window._limitMB)) + 'MB';
+        if (d.vip_checked_at) vh += '<br /><span style="color:var(--weak);font-size:11.5px">检测时间：' + escHtml(d.vip_checked_at) + '</span>';
+        vb.innerHTML = vh;
+      }
+      const lvInput = document.getElementById('levelLimits');
+      if (lvInput && document.activeElement !== lvInput && d.level_limits) {
+        lvInput.value = Object.keys(d.level_limits).map(k => k + '=' + d.level_limits[k]).join(',');
+      }
+      const vBox = document.getElementById('verBox');
+      if (vBox && d.version) vBox.innerHTML = '当前版本：<span style="font-family:var(--font-m)">' + escHtml(d.version) + '</span>（点“检查更新”对比最新版）';
+
+      if (d.last_error && /账号登录失败/.test(d.last_error)) toast('账号登录失败', 'err');
     })
     .catch(e => document.getElementById('statusBox').textContent = '获取状态失败');
 }
+
+function doLogin() {
+  const u = document.getElementById('loginUser').value.trim();
+  const p = document.getElementById('loginPass').value;
+  if (!u || !p) { toast('请填写账号和密码', 'err'); return; }
+  const fd = new FormData();
+  fd.append('username', u);
+  fd.append('password', p);
+  toast('正在登录，请稍候…');
+  fetch('/lanzou-test.php?ajax=login', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(j => {
+      if (j.code === 0) {
+        document.getElementById('loginPass').value = '';
+        const d = j.data || {};
+        toast('登录成功：UID ' + (d.uid || '—') + (d.vip ? '（VIP）' : ''), 'ok');
+        loadStatus();
+        loadList();
+      } else {
+        toast('账号登录失败' + (j.detail ? '：' + j.detail : (j.msg ? '：' + j.msg : '')), 'err');
+        loadStatus();
+      }
+    })
+    .catch(e => toast('账号登录失败：请求异常', 'err'));
+}
+
+function doLogout() {
+  if (!confirm('退出后需重新登录才能管理文件，确认退出？')) return;
+  fetch('/lanzou-test.php?ajax=logout', { method: 'POST' })
+    .then(r => r.json())
+    .then(j => {
+      toast(j.code === 0 ? '已退出登录' : ('退出失败：' + (j.msg || '')), j.code === 0 ? 'ok' : 'err');
+      loadStatus();
+    })
+    .catch(e => toast('请求失败', 'err'));
+}
+
+function saveLimits() {
+  const mb = document.getElementById('maxUpMB').value.trim();
+  if (!mb) { toast('请填写上限（MB）', 'err'); return; }
+  const fd = new FormData();
+  fd.append('max_upload_mb', mb);
+  fetch('/lanzou-test.php?ajax=limits', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(j => {
+      if (j.code === 0) { toast('上传上限已更新为 ' + mb + 'MB', 'ok'); loadStatus(); }
+      else toast('保存失败：' + (j.msg || ''), 'err');
+    })
+    .catch(e => toast('请求失败', 'err'));
+}
+
+function checkVip() {
+  toast('正在检测 VIP 状态…');
+  fetch('/lanzou-test.php?ajax=check_vip')
+    .then(r => r.json())
+    .then(j => {
+      if (j.code === 0) {
+        const d = j.data || {};
+        toast('检测完成：' + (d.vip ? 'VIP' + (d.vip_level || '') : '非 VIP') +
+              (d.vip_expire ? '，到期 ' + d.vip_expire : '') + '，重命名机制 ' + d.rename_mode, 'ok');
+        loadStatus();
+      } else {
+        toast('检测失败：' + (j.msg || j.detail || ''), 'err');
+      }
+    })
+    .catch(e => toast('请求失败', 'err'));
+}
+
+function saveLevelLimits() {
+  const v = document.getElementById('levelLimits').value.trim();
+  if (!v) { toast('请填写等级上限，如 1=200,2=500', 'err'); return; }
+  const fd = new FormData();
+  fd.append('level_limits', v);
+  fetch('/lanzou-test.php?ajax=limits', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(j => {
+      if (j.code === 0) { toast('等级上限已保存', 'ok'); loadStatus(); }
+      else toast('保存失败：' + (j.msg || ''), 'err');
+    })
+    .catch(e => toast('请求失败', 'err'));
+}
+
+function checkUpdate() {
+  toast('正在检查更新…');
+  fetch('/lanzou-test.php?ajax=version')
+    .then(r => r.json())
+    .then(j => {
+      const box = document.getElementById('verBox');
+      if (j.code !== 0) {
+        if (box) box.innerHTML = '<span style="color:#fda4af">检查失败：' + escHtml(j.msg || '') + '</span>';
+        toast('检查更新失败：' + (j.msg || ''), 'err');
+        return;
+      }
+      const d = j.data || {};
+      const html = '当前版本：<span style="font-family:var(--font-m)">' + escHtml(d.current || '') + '</span>' +
+        '<br />最新版本：<span style="font-family:var(--font-m)">' + escHtml(d.latest || '') + '</span>' +
+        '<br />状态：' + (d.has_update
+          ? '<span style="color:#fbbf24">有新版本可更新</span>'
+          : '<span style="color:#86efac">已是最新</span>') +
+        (d.asset_name ? '<br />更新包：' + escHtml(d.asset_name) + (d.asset_size ? '（' + Math.round(d.asset_size / 1048576 * 10) / 10 + 'MB）' : '') : '') +
+        '<br /><span style="color:var(--weak);font-size:11.5px">检查时间：' + escHtml(d.checked_at || '') + '</span>';
+      if (box) box.innerHTML = html;
+      toast(d.has_update ? '发现新版本 ' + (d.latest || '') : '已是最新版本', d.has_update ? 'ok' : 'ok');
+    })
+    .catch(e => toast('请求失败', 'err'));
+}
+
+function doUpdate() {
+  if (!confirm('将从 GitHub 下载最新版本并替换当前程序，随后自动重启，确认继续？')) return;
+  toast('正在下载更新，请稍候…');
+  const fd = new FormData();
+  fd.append('confirm', '1');
+  fetch('/lanzou-test.php?ajax=update', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(j => {
+      if (j.code === 0) toast('更新完成，服务正在重启，稍后刷新页面', 'ok');
+      else toast('更新失败：' + (j.msg || j.detail || ''), 'err');
+    })
+    .catch(e => toast('更新失败：请求异常（服务可能正在重启）', 'err'));
+}
+
+function toggleAutoShare() {
+  const want = window._autoShare ? '0' : '1';
+  const fd = new FormData();
+  fd.append('auto_share', want);
+  fetch('/lanzou-test.php?ajax=limits', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(j => {
+      if (j.code === 0) { window._autoShare = want === '1'; toast('自动分享已' + (window._autoShare ? '开启' : '关闭'), 'ok'); loadStatus(); }
+      else toast('设置失败：' + (j.msg || ''), 'err');
+    });
+}
+
 function saveCookie() {
   const ck = document.getElementById('cookieInput').value.trim();
   if (!ck) { toast('请粘贴 Cookie', 'err'); return; }
@@ -946,10 +1301,11 @@ function saveCookie() {
     .then(r => r.json())
     .then(j => {
       if (j.code === 0) {
+        document.getElementById('cookieInput').value = '';
         toast('Cookie 有效，已保存并生效', 'ok');
         loadStatus();
       } else {
-        toast('Cookie 无效：' + (j.msg || j.detail || '检测失败') + '（已保留之前的 Cookie）', 'err');
+        toast('Cookie 无效：' + (j.msg || j.detail || '检测失败') + '（已保留之前的登录态）', 'err');
         loadStatus();
       }
     })
@@ -969,10 +1325,21 @@ function copyText(t) {
 }
 function escId(s) { return String(s).replace(/[^a-zA-Z0-9\-]/g, ''); }
 function escHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
-function escJs(s) { return String(s).replace(/\\/g, '\\\\').replace(/'/g, '\\\''); }
+/* escJs 用于把名称安全地嵌入 onclick 的双引号属性里的单引号 JS 字符串：
+   先转义反斜杠与 &，再把 " < > 转成实体（HTML 解码后仍是合法 JS 字符串内容），最后转义单引号 */
+function escJs(s) {
+  return String(s)
+    .replace(/\\/g, '\\\\')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/'/g, '\\\'');
+}
 
 /* 初始加载：支持 ?tab= 深链接 */
 (function() {
+  loadStatus();
   const m = location.search.match(/[?&]tab=([a-z]+)/i);
   if (m && ['files', 'share', 'settings'].indexOf(m[1]) >= 0) { switchTab(m[1]); } else { loadList('0'); }
 })();
