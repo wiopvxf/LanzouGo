@@ -2890,7 +2890,7 @@ func apiUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respOK(w, "更新完成，正在重启", map[string]interface{}{
-		"from": version, "to": rel.TagName, "binary": exe, "backup": tmp,
+		"from": version, "to": rel.TagName, "binary": exe, "staged": tmp,
 	})
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
