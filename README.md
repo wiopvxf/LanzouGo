@@ -1,7 +1,8 @@
-# LanzouGo v1.3.0 — 蓝奏云三合一管理服务（Go）
+# LanzouGo v1.4.0 — 蓝奏云三合一管理服务（Go）
 
 把三块能力整合进**一个 Go 二进制**：**上传 + 文件列表 + 分享解析直链**。
 v1.1 起支持**账号密码登录**：登录后自动获取 Cookie，Cookie 失效自动重新登录，账号信息（UID / VIP / 上传上限）自动获取。
+v1.4 加入 **卸载程序 + 应用数据打包**：卸载时把账号/配置/密钥打成一个 `lanzougo-backup-<时间>.7z`（7z 极限压缩 + 固定密钥），旁边生成说明 `.txt`，其余文件全部删除；重装后启动**自动发现并解密恢复**。
 v1.3 加入 **自动更新**：启动即检查 GitHub Release，发现新版本自动下载、替换二进制并重启（默认开启，可关）。
 v1.2 加入 **VIP 自动检测**（等级 / 到期时间 / 剩余天数 / 容量）、**按 VIP 切换重命名机制与上传上限**、**受限后缀自动加 `(c).zip`**、**上传文件名校验**、**检查更新 + 一键自更新**。
 
@@ -41,6 +42,8 @@ curl -X POST -d "cookie=phpdisk_info=xxx" http://127.0.0.1:8080/api/cookie
 | 文件名校验 | 上传/重命名时文件名不能为空白，且**至少 2 个字符**，否则直接 400，不会白传 |
 | 检查更新 | `GET /api/version` 对比 GitHub Release（限流时可配 `github_token` 或用 `-check-update`） |
 | 自更新 | `POST /api/update`（`confirm=1`）下载对应平台二进制 → 替换 → 自动重启 |
+| **卸载程序** | 面板设置页底部 / `POST /api/uninstall`；勾选保留数据则 7z 打包 `lanzougo-backup-*.7z` + `.txt` 说明，未勾选则连数据一起删；完成后自删二进制并退出 |
+| **重装自动恢复** | 启动时若配置缺失（或 `-restore`），自动扫描程序目录 / 当前目录 / 配置目录里最新的 `lanzougo-backup-*.7z`，用固定密钥解密并铺回，参数自动生效 |
 | **自动更新** | **默认开启**：启动 8 秒后检查一次，发现新版本**立即**下载 → 替换 → 重启；之后每 `auto_update_interval_min`（默认 30）分钟轮询。`auto_update=0` 关闭，`allow_update=0` 为总开关 |
 | Cookie 不外泄 | 所有响应不含 Cookie；`/api/status` 只给 `sha256:` 前 8 位摘要；下载代理不携带登录 Cookie |
 
@@ -53,6 +56,8 @@ curl -X POST -d "cookie=phpdisk_info=xxx" http://127.0.0.1:8080/api/cookie
 | `/api/cookie` | POST | 手动写入 Cookie（自动验证） |
 | `/api/status` | GET | 账号状态（uid / vip / VIP 等级 / 到期 / 重命名机制 / 上传上限 / 版本），无 Cookie 原文 |
 | `/api/check_vip` | GET | 强制检测 Cookie：VIP 状态、VIP 几、到期时间、剩余天数、容量 |
+| `/api/uninstall` | POST | 卸载（`confirm=1`；`keep_data=0` 则连数据一起删） |
+| `/api/uninstall/status` | GET | 卸载进度（stage / percent / archive / done） |
 | `/api/version` | GET | 检查更新（对比 GitHub Release，含更新包名与大小） |
 | `/api/update` | POST | 自更新（`confirm=1`，需 `allow_update` 开启） |
 | `/api/account` | GET | 账号信息（uid / vip / 上传上限） |
@@ -105,6 +110,9 @@ curl "http://127.0.0.1:8080/api/parse?url=https://wwi.lanzou.com/xxxx&pwd=密码
 | `-update` | 无 | 检查并直接执行自更新（替换二进制）后退出 |
 | `-no-update` | 无 | 关闭自更新（写回 `allow_update=false`、`auto_update=false`） |
 | `-no-auto-update` | 无 | 只关闭自动更新，保留手动 `/api/update` |
+| `-uninstall` | 无 | 命令行卸载（配合 `-keep-data 1/0`） |
+| `-keep-data` | `1` | 卸载时是否保留数据（打包成 7z） |
+| `-restore` | 无 | 强制从 `lanzougo-backup-*.7z` 恢复配置（默认仅配置缺失时自动恢复） |
 
 ## 配置说明
 
@@ -130,6 +138,7 @@ curl "http://127.0.0.1:8080/api/parse?url=https://wwi.lanzou.com/xxxx&pwd=密码
   "allow_update": true,
   "auto_update": true,
   "auto_update_interval_min": 30,
+  "seven_zip": "",
   "github_token": "可选：ghp_xxx，仅用于避免 GitHub API 限流",
   "updated_at": "2026-11-15T09:00:00+08:00"
 }
@@ -146,6 +155,7 @@ curl "http://127.0.0.1:8080/api/parse?url=https://wwi.lanzou.com/xxxx&pwd=密码
 - 状态卡显示 UID / VIP / 上传上限 / Cookie 摘要（不含原文）
 - 上传前按服务端返回的上限做预检，超限直接提示，避免白传
 - 重命名按钮会显示本次走的是「蓝奏原生」还是「回退重传」
+- v1.4 设置页底部新增「卸载程序」卡（确认框 + 保留数据勾选 + 卸载进度条）
 - v1.3 设置页「检查更新」卡可开关自动更新、设置检查间隔、手动立即更新
 - v1.2 设置页新增「VIP 状态」卡（立即检测 / 显示 VIP 几、到期时间、剩余天数、当前机制、按等级设上限）和「检查更新」卡（检查 + 一键更新）
 - PHP 侧限制：`php.ini` 的 `upload_max_filesize` / `post_max_size` 必须大于你要传的文件，否则 PHP 会先拒绝（面板会明确提示这两个值）
@@ -162,6 +172,15 @@ GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o lanzou-server-amd64 main.go
 # Linux arm64（ARM 服务器 / Termux）
 GOOS=linux GOARCH=arm64 go build -ldflags "-s -w" -o lanzou-server-arm64 main.go
 ```
+
+## 卸载与数据备份说明
+
+1. 面板「设置 → 卸载程序」或 `POST /api/uninstall`（`confirm=1`）触发，界面弹确认框，勾选“保留数据”默认打开。
+2. 保留数据时：把 `lanzou.json`（账号 / Cookie / VIP / 上传上限等全部配置）与 `lanzou.key`（密码加密密钥）打成 `lanzougo-backup-<YYYYMMDD-HHMMSS>.7z`，同目录生成同名 `.txt` 说明用途、内容、解压方式。
+3. 压缩参数：`-t7z -m0=lzma2 -mx=9 -mfb=273 -md=64m -ms=on -mhe=on`（极限压缩 + 头部加密），密钥为程序内置的 **16 位固定密钥**（`backupKey`）。
+4. 需要系统里有 7z：`apt install p7zip-full`，或把 `7zz` 放到程序目录，或用配置项 `seven_zip` 指定路径。**找不到 7z 时**退化为 0600 权限的明文备份目录（仍会生成说明，重装同样能恢复）。
+5. 打包完成后原配置与二进制都会被删除（未勾选保留数据则连备份一起删），随后进程退出。
+6. 重装：把 `lanzougo-backup-*.7z` 留在程序目录，启动即自动恢复；也可 `./lanzou-server -restore` 强制恢复。
 
 ## 自动更新说明
 

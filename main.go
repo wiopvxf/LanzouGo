@@ -44,7 +44,7 @@ import (
 	"unicode/utf8"
 )
 
-const version = "1.3.0"
+const version = "1.4.0"
 
 const (
 	repoOwner = "wiopvxf"
@@ -300,6 +300,7 @@ type Config struct {
 	AutoUpdate            bool           `json:"auto_update"`                        // 自动更新：发现新版本立刻下载替换并重启，默认开
 	AutoUpdateIntervalMin int            `json:"auto_update_interval_min,omitempty"` // 自动检查间隔（分钟），默认 30
 	GitHubToken           string         `json:"github_token,omitempty"`             // 可选：GitHub Token，避免 API 限流
+	SevenZipPath          string         `json:"seven_zip,omitempty"`                // 可选：7z 可执行文件路径（默认自动查找 7z/7zz/7za）
 	Token                 string         `json:"token,omitempty"`                    // 访问令牌，为空则不校验
 	UpdatedAt             string         `json:"updated_at,omitempty"`
 }
@@ -3008,29 +3009,401 @@ func apiUpdate(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
+// ======================================================================
+// 卸载程序：应用数据打包（7z 极限压缩 + 固定密钥）→ 删除其余文件
+// 重新安装时自动发现 lanzougo-backup-*.7z 并解密恢复
+// ======================================================================
+
+const (
+	backupPrefix = "lanzougo-backup"
+	backupKey    = "Lz9Gox7Kq2Wm5Rt8" // 固定 16 位密钥（大小写字母+数字）
+)
+
+func absDir(p string) string {
+	if p == "" {
+		return "."
+	}
+	if a, err := filepath.Abs(p); err == nil {
+		return filepath.Dir(a)
+	}
+	return "."
+}
+
+func exeDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	return filepath.Dir(exe)
+}
+
+// find7z 依次在配置、PATH、程序目录里找 7z 可执行文件
+func find7z() string {
+	if p := strings.TrimSpace(cfgGet().SevenZipPath); p != "" {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	for _, name := range []string{"7z", "7zz", "7za", "7zr"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p
+		}
+	}
+	for _, cand := range []string{
+		filepath.Join(exeDir(), "7zz"),
+		filepath.Join(exeDir(), "7z"),
+		"/usr/lib/p7zip/7z",
+		"/usr/local/bin/7zz",
+	} {
+		if _, err := os.Stat(cand); err == nil {
+			return cand
+		}
+	}
+	return ""
+}
+
+type uninstallState struct {
+	mu      sync.RWMutex
+	running bool
+	stage   string
+	percent int
+	done    bool
+	err     string
+	archive string
+	note    string
+}
+
+var unJob = &uninstallState{}
+
+func (u *uninstallState) set(stage string, pct int) {
+	u.mu.Lock()
+	u.stage, u.percent = stage, pct
+	u.mu.Unlock()
+}
+
+func (u *uninstallState) snapshot() map[string]interface{} {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return map[string]interface{}{
+		"running": u.running, "stage": u.stage, "percent": u.percent,
+		"done": u.done, "error": u.err, "archive": u.archive, "note": u.note,
+	}
+}
+
+// dataFiles 需要保留打包的数据文件（存在才收集）
+func dataFiles() []string {
+	out := []string{}
+	for _, f := range []string{cfgPath, keyPath} {
+		if _, err := os.Stat(f); err == nil {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func stamp() string { return time.Now().Format("20060102-150405") }
+
+// packData 用 7z 极限压缩打包；没有 7z 时退化为受保护目录（0600），并返回说明
+func packData(dir string, files []string) (archive string, usedSeven bool, err error) {
+	if len(files) == 0 {
+		return "", false, errors.New("没有需要保留的数据文件")
+	}
+	base := fmt.Sprintf("%s-%s", backupPrefix, stamp())
+	seven := find7z()
+	if seven == "" {
+		// 退化：明文目录（仅本用户可读），提示用户自行加密
+		dest := filepath.Join(dir, base)
+		if err := os.MkdirAll(dest, 0700); err != nil {
+			return "", false, err
+		}
+		for _, f := range files {
+			data, e := os.ReadFile(f)
+			if e != nil {
+				return "", false, e
+			}
+			if e := os.WriteFile(filepath.Join(dest, filepath.Base(f)), data, 0600); e != nil {
+				return "", false, e
+			}
+		}
+		return dest, false, nil
+	}
+	archive = filepath.Join(dir, base+".7z")
+	args := []string{
+		"a", "-t7z", "-m0=lzma2", "-mx=9", "-mfb=273", "-md=64m", "-ms=on",
+		"-mhe=on", "-p" + backupKey, "-y", archive,
+	}
+	for _, f := range files {
+		args = append(args, filepath.Base(f))
+	}
+	cmd := exec.Command(seven, args...)
+	cmd.Dir = dir
+	out, e := cmd.CombinedOutput()
+	if e != nil {
+		return "", true, fmt.Errorf("7z 打包失败：%v（%s）", e, strings.TrimSpace(string(out)))
+	}
+	return archive, true, nil
+}
+
+func writeBackupNote(archive string, usedSeven bool) string {
+	note := archive + ".txt"
+	var sb strings.Builder
+	sb.WriteString("LanzouGo 数据备份说明\n")
+	sb.WriteString("=============================\n")
+	sb.WriteString("用途：卸载程序时保留的应用数据，重装 LanzouGo 时会自动识别并解密恢复\n")
+	sb.WriteString("创建时间：" + time.Now().Format("2006-01-02 15:04:05") + "\n")
+	sb.WriteString("程序版本：" + version + "\n")
+	sb.WriteString("打包内容：lanzou.json（账号/Cookie/VIP/上传上限等全部配置）、lanzou.key（密码加密密钥，缺失会导致已保存密码无法解密）\n")
+	if usedSeven {
+		sb.WriteString("压缩方式：7z（LZMA2 -mx=9 极限压缩，头部加密 -mhe=on）\n")
+		sb.WriteString("解压命令：7z x -p<固定密钥> \"" + filepath.Base(archive) + "\" -o.\n")
+		sb.WriteString("说明：密码为程序内置的 16 位固定密钥（见源码 backupKey / README），不在此明写；正常重装无需手动解压，把压缩包放到程序目录启动即可自动恢复。\n")
+	} else {
+		sb.WriteString("压缩方式：未找到 7z 可执行文件，数据以 0600 权限的明文目录保留，建议自行加密打包。\n")
+		sb.WriteString("恢复方式：把该目录内的文件拷回程序目录即可。\n")
+	}
+	_ = os.WriteFile(note, []byte(sb.String()), 0600)
+	return note
+}
+
+// findBackupArchive 在程序目录 / 当前目录 / 配置目录里找最新的备份
+func findBackupArchive() string {
+	dirs := []string{exeDir(), absDir(cfgPath)}
+	if cwd, err := os.Getwd(); err == nil {
+		dirs = append(dirs, cwd)
+	}
+	seen := map[string]bool{}
+	best := ""
+	for _, d := range dirs {
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() {
+				if strings.HasPrefix(name, backupPrefix) && !strings.Contains(name, ".") {
+					full := filepath.Join(d, name)
+					if full > best {
+						best = full
+					}
+				}
+				continue
+			}
+			if strings.HasPrefix(name, backupPrefix) && strings.HasSuffix(strings.ToLower(name), ".7z") {
+				full := filepath.Join(d, name)
+				if full > best {
+					best = full
+				}
+			}
+		}
+	}
+	return best
+}
+
+// restoreFromBackup 解密（7z，固定密钥）并铺回配置目录
+func restoreFromBackup(archive string) error {
+	dir := absDir(cfgPath)
+	if st, err := os.Stat(archive); err == nil && st.IsDir() {
+		// 明文目录退化备份
+		entries, err := os.ReadDir(archive)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(archive, e.Name()))
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(dir, e.Name()), data, 0600); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	seven := find7z()
+	if seven == "" {
+		return fmt.Errorf("未找到 7z 可执行文件，无法解密 %s（请先安装 p7zip 或放置 7zz）", filepath.Base(archive))
+	}
+	cmd := exec.Command(seven, "x", "-p"+backupKey, "-y", "-o"+dir, archive)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("7z 解压失败：%v（%s）", err, strings.TrimSpace(string(out)))
+	}
+	for _, f := range []string{cfgPath, keyPath} {
+		_ = os.Chmod(f, 0600)
+	}
+	return nil
+}
+
+// autoRestore 未指定 -restore 时，仅当配置缺失才自动恢复
+func autoRestore(force bool) {
+	if !force {
+		if _, err := os.Stat(cfgPath); err == nil {
+			return
+		}
+	}
+	arch := findBackupArchive()
+	if arch == "" {
+		if force {
+			fmt.Println("[restore] 未找到 lanzougo-backup-*.7z")
+		}
+		return
+	}
+	fmt.Printf("[restore] 发现应用数据备份：%s，开始解密恢复\n", arch)
+	if err := restoreFromBackup(arch); err != nil {
+		fmt.Printf("[restore] 恢复失败：%v\n", err)
+		return
+	}
+	fmt.Printf("[restore] 已恢复到 %s（账号/Cookie/VIP/上传上限等参数自动生效）\n", absDir(cfgPath))
+}
+
+func removeSelf() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	if real, e := filepath.EvalSymlinks(exe); e == nil {
+		exe = real
+	}
+	_ = os.Remove(exe + ".new")
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command("cmd", "/c", "ping -n 3 127.0.0.1 >nul & del /f /q \""+exe+"\"")
+		_ = cmd.Start()
+		return
+	}
+	if err := os.Remove(exe); err != nil {
+		cmd := exec.Command("sh", "-c", "sleep 2; rm -f \"$1\" \"$1.new\"", "sh", exe)
+		_ = cmd.Start()
+	}
+}
+
+// doUninstall 同步执行整套卸载；keepData=true 时先打包应用数据
+func doUninstall(keepData bool, progress func(stage string, pct int)) (string, string, error) {
+	if progress == nil {
+		progress = func(string, int) {}
+	}
+	dir := absDir(cfgPath)
+	files := dataFiles()
+
+	var archive, note string
+	if keepData {
+		progress("正在准备应用数据", 10)
+		var usedSeven bool
+		var err error
+		archive, usedSeven, err = packData(dir, files)
+		if err != nil {
+			return "", "", err
+		}
+		progress("正在打包应用数据（7z 极限压缩）", 70)
+		note = writeBackupNote(archive, usedSeven)
+		progress("已生成备份与说明文件", 80)
+	}
+
+	progress("正在删除程序文件", 88)
+	exe, _ := os.Executable()
+	if real, e := filepath.EvalSymlinks(exe); e == nil {
+		exe = real
+	}
+	_ = os.Remove(exe + ".new")
+	removeSelf()
+	// 应用数据已进压缩包：无论是否勾选保留，都清掉原文件；未勾选保留时连备份一起不要
+	for _, f := range files {
+		_ = os.Remove(f)
+	}
+	_ = os.Remove(cfgPath + ".tmp")
+	if !keepData {
+		if archive != "" {
+			_ = os.Remove(archive)
+		}
+		if note != "" {
+			_ = os.Remove(note)
+		}
+	}
+	progress("卸载完成", 100)
+	return archive, note, nil
+}
+
+func apiUninstall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		respErr(w, 405, "请使用 POST")
+		return
+	}
+	_ = r.ParseForm()
+	if r.PostFormValue("confirm") != "1" {
+		respErr(w, 400, "需要 confirm=1 才会卸载")
+		return
+	}
+	unJob.mu.RLock()
+	running := unJob.running
+	unJob.mu.RUnlock()
+	if running {
+		respErr(w, 409, "卸载任务正在进行")
+		return
+	}
+	keep := r.PostFormValue("keep_data") != "0"
+
+	unJob.mu.Lock()
+	unJob.running, unJob.done, unJob.err = true, false, ""
+	unJob.stage, unJob.percent, unJob.archive, unJob.note = "正在准备卸载", 5, "", ""
+	unJob.mu.Unlock()
+
+	respOK(w, "开始卸载", map[string]interface{}{"keep_data": keep})
+
+	go func() {
+		archive, note, err := doUninstall(keep, func(stage string, pct int) { unJob.set(stage, pct) })
+		unJob.mu.Lock()
+		unJob.archive, unJob.note = archive, note
+		if err != nil {
+			unJob.err = err.Error()
+			unJob.stage = "卸载失败：" + err.Error()
+			unJob.running = false
+			unJob.mu.Unlock()
+			return
+		}
+		unJob.done = true
+		unJob.running = false
+		unJob.mu.Unlock()
+		time.Sleep(1200 * time.Millisecond)
+		os.Exit(0)
+	}()
+}
+
+func apiUninstallStatus(w http.ResponseWriter, r *http.Request) {
+	respOK(w, "ok", unJob.snapshot())
+}
+
 func apiHelp(w http.ResponseWriter, r *http.Request) {
 	respOK(w, "lanzou v"+version, map[string]interface{}{
 		"apis": map[string]string{
-			"GET  /api/status":        "账号状态（不含 Cookie）",
-			"GET  /api/check_vip":     "强制检测 Cookie：VIP 状态 / 等级 / 到期时间 / 上传上限",
-			"GET  /api/version":       "检查更新（对比 GitHub Release）",
-			"POST /api/update":        "自更新（需 confirm=1）",
-			"GET  /api/account":       "账号信息（uid / vip / 上传上限）",
-			"POST /api/login":         "username&password 登录并自动保存 Cookie",
-			"POST /api/logout":        "退出并清除账号密码与 Cookie",
-			"POST /api/cookie":        "cookie=... 手动写入 Cookie（会自动验证）",
-			"GET  /api/limits":        "查看上传限制",
-			"POST /api/limits":        "VIP 可调 max_upload_mb；也可 auto_share/share_pwd",
-			"GET  /api/list":          "?folder=0 文件列表（Cookie 失效自动重登）",
-			"POST /api/upload":        "path=&folder=0 上传（非 VIP 单文件 100MB）",
-			"POST /api/mkdir":         "name=&parent=0 新建文件夹",
-			"POST /api/delete":        "id=&type=file|folder 删除",
-			"POST /api/share":         "file_id=&pwd= 生成分享",
-			"GET  /api/parse":         "?url=&pwd= 解析分享链接",
-			"GET  /api/download":      "?url= 代理下载（仅蓝奏域名）",
-			"POST /api/save":          "url=&pwd=&folder= 转存",
-			"POST /api/rename":        "file_id=&name=&folder= 重命名（优先原生，失败回退重传）",
-			"POST /api/rename_folder": "folder_id=&name=&parent= 文件夹重命名",
+			"GET  /api/status":           "账号状态（不含 Cookie）",
+			"GET  /api/check_vip":        "强制检测 Cookie：VIP 状态 / 等级 / 到期时间 / 上传上限",
+			"GET  /api/version":          "检查更新（对比 GitHub Release）",
+			"POST /api/update":           "自更新（需 confirm=1）",
+			"POST /api/uninstall":        "卸载程序（confirm=1；keep_data=0 则连配置一起删）",
+			"GET  /api/uninstall/status": "卸载进度",
+			"GET  /api/account":          "账号信息（uid / vip / 上传上限）",
+			"POST /api/login":            "username&password 登录并自动保存 Cookie",
+			"POST /api/logout":           "退出并清除账号密码与 Cookie",
+			"POST /api/cookie":           "cookie=... 手动写入 Cookie（会自动验证）",
+			"GET  /api/limits":           "查看上传限制",
+			"POST /api/limits":           "VIP 可调 max_upload_mb；也可 auto_share/share_pwd",
+			"GET  /api/list":             "?folder=0 文件列表（Cookie 失效自动重登）",
+			"POST /api/upload":           "path=&folder=0 上传（非 VIP 单文件 100MB）",
+			"POST /api/mkdir":            "name=&parent=0 新建文件夹",
+			"POST /api/delete":           "id=&type=file|folder 删除",
+			"POST /api/share":            "file_id=&pwd= 生成分享",
+			"GET  /api/parse":            "?url=&pwd= 解析分享链接",
+			"GET  /api/download":         "?url= 代理下载（仅蓝奏域名）",
+			"POST /api/save":             "url=&pwd=&folder= 转存",
+			"POST /api/rename":           "file_id=&name=&folder= 重命名（优先原生，失败回退重传）",
+			"POST /api/rename_folder":    "folder_id=&name=&parent= 文件夹重命名",
 		},
 		"version": version,
 	})
@@ -3094,6 +3467,9 @@ func main() {
 	updateFlag := false
 	noUpdate := false
 	noAutoUpdate := false
+	restoreFlag := false
+	uninstallFlag := false
+	keepData := true
 
 	for i, a := range os.Args {
 		switch a {
@@ -3125,6 +3501,14 @@ func main() {
 			noUpdate = true
 		case "-no-auto-update":
 			noAutoUpdate = true
+		case "-restore":
+			restoreFlag = true
+		case "-uninstall":
+			uninstallFlag = true
+		case "-keep-data":
+			if i+1 < len(os.Args) {
+				keepData = os.Args[i+1] != "0"
+			}
 		case "-maxupload":
 			if i+1 < len(os.Args) {
 				if n, err := strconv.Atoi(os.Args[i+1]); err == nil && n > 0 {
@@ -3135,6 +3519,23 @@ func main() {
 	}
 
 	initUploadRoots([]string{uploadDir})
+
+	if uninstallFlag {
+		fmt.Printf("正在卸载 LanzouGo（保留数据：%v）\n", keepData)
+		archive, note, err := doUninstall(keepData, func(stage string, pct int) {
+			fmt.Printf("  [%3d%%] %s\n", pct, stage)
+		})
+		if err != nil {
+			fmt.Printf("卸载失败：%v\n", err)
+			return
+		}
+		if archive != "" {
+			fmt.Printf("应用数据已备份：%s\n说明文件：%s\n", archive, note)
+		}
+		fmt.Println("卸载完成")
+		return
+	}
+	autoRestore(restoreFlag)
 
 	if err := loadCfg(); err != nil && !os.IsNotExist(err) {
 		fmt.Printf("[warn] 读取配置失败：%v\n", err)
@@ -3214,6 +3615,8 @@ func main() {
 	mux.HandleFunc("/api/check_vip", apiCheckVIP)
 	mux.HandleFunc("/api/version", apiVersion)
 	mux.HandleFunc("/api/update", apiUpdate)
+	mux.HandleFunc("/api/uninstall", apiUninstall)
+	mux.HandleFunc("/api/uninstall/status", apiUninstallStatus)
 	mux.HandleFunc("/api/account", apiAccount)
 	mux.HandleFunc("/api/login", apiLogin)
 	mux.HandleFunc("/api/logout", apiLogout)

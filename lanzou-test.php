@@ -158,6 +158,19 @@ if ($ajax !== '') {
     if ($ajax === 'version') {
         jsend(apiReq($API . '/api/version', null, 30));
     }
+    /* 卸载：应用数据打包保留，其余删除；进度用 uninstall_status 轮询 */
+    if ($ajax === 'uninstall') {
+        if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+            jsend(['code' => 405, 'msg' => '请使用 POST']);
+        }
+        jsend(apiReq($API . '/api/uninstall', [
+            'confirm'   => '1',
+            'keep_data' => ($_POST['keep_data'] ?? '1') === '0' ? '0' : '1',
+        ], 300));
+    }
+    if ($ajax === 'uninstall_status') {
+        jsend(apiReq($API . '/api/uninstall/status', null, 10));
+    }
     if ($ajax === 'update') {
         if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
             jsend(['code' => 405, 'msg' => '请使用 POST']);
@@ -522,6 +535,11 @@ tbody tr:last-child td{border-bottom:none}
       <textarea id="cookieInput" rows="3" style="width:100%;background:rgba(9,15,27,.8);border:1px solid var(--line);color:var(--txt);border-radius:11px;padding:10px;font-size:12px;font-family:var(--font-m);resize:vertical" placeholder="粘贴完整 Cookie，例如：phpdisk_info=xxx; PHPSESSID=xxx; …" aria-label="Cookie" autocomplete="off" spellcheck="false"></textarea>
       <div class="inrow" style="margin-top:10px"><button type="button" style="flex:1" onclick="saveCookie()">保存并检测</button></div>
     </div>
+    <div class="card">
+      <div class="t"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>卸载程序</div>
+      <div style="font-size:11.5px;color:var(--weak);line-height:1.6;margin-bottom:9px">卸载会删除程序文件；应用数据（账号/Cookie/VIP/上传上限等配置 + 密钥）会打包成 <span style="font-family:var(--font-m)">lanzougo-backup-*.7z</span>（7z 极限压缩、固定密钥加密），旁边生成同名 .txt 说明用途。重装后启动会自动找到并解密恢复。</div>
+      <div class="inrow"><button type="button" style="flex:1;background:#b91c1c" onclick="openUninstall()">卸载程序</button></div>
+    </div>
   </div>
 </div>
 
@@ -538,6 +556,28 @@ tbody tr:last-child td{border-bottom:none}
 <!-- 通用弹窗 -->
 <div class="mask" id="dlgMask" onclick="if(event.target===this)closeDlg()">
   <div class="dialog" id="dlgBox"></div>
+</div>
+
+<!-- 卸载确认 -->
+<div class="mask" id="unMask" onclick="if(event.target===this)closeUninstall()">
+  <div class="dialog">
+    <h3>是否卸载本程序？<button class="x" type="button" onclick="closeUninstall()">×</button></h3>
+    <div class="dline">卸载会删除程序文件，并结束当前服务。请确认。</div>
+    <label style="display:flex;align-items:flex-start;gap:9px;margin:14px 0;font-size:13.5px;color:var(--txt);cursor:pointer">
+      <input type="checkbox" id="unKeep" checked style="width:17px;height:17px;margin-top:2px;accent-color:#22c55e" />
+      <span>保留数据<span style="display:block;color:var(--weak);font-size:11.5px;margin-top:3px">勾选：应用数据打包为 <span style="font-family:var(--font-m)">lanzougo-backup-*.7z</span>（7z 极限压缩 + 固定密钥）并生成同名说明 .txt；重装后自动解密恢复<br />不勾选：数据与备份一并删除，等同彻底清除</span></span>
+    </label>
+    <div class="dacts"><button class="btn gray" type="button" style="background:rgba(148,163,184,.18);color:var(--txt)" onclick="closeUninstall()">取消</button><button type="button" style="background:#b91c1c" onclick="confirmUninstall()">卸载</button></div>
+  </div>
+</div>
+
+<!-- 卸载进度 -->
+<div class="upmask" id="unProgMask">
+  <div class="upbox">
+    <div class="fname" id="unStage">正在卸载程序…</div>
+    <div class="upbar"><i id="unBarFill" style="width:0%"></i></div>
+    <div class="pct" id="unPct">0%</div>
+  </div>
 </div>
 
 <!-- 底部导航 -->
@@ -1273,6 +1313,71 @@ function checkUpdate() {
       toast(d.has_update ? '发现新版本 ' + (d.latest || '') : '已是最新版本', d.has_update ? 'ok' : 'ok');
     })
     .catch(e => toast('请求失败', 'err'));
+}
+
+function openUninstall() {
+  const keep = document.getElementById('unKeep');
+  if (keep) keep.checked = true;
+  document.getElementById('unMask').classList.add('on');
+}
+
+function closeUninstall() {
+  document.getElementById('unMask').classList.remove('on');
+}
+
+function setUnProgress(pct, stage) {
+  const bar = document.getElementById('unBarFill');
+  const pctEl = document.getElementById('unPct');
+  if (bar) bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+  if (pctEl) pctEl.textContent = Math.round(pct) + '%';
+  if (stage) document.getElementById('unStage').textContent = stage;
+}
+
+function confirmUninstall() {
+  const keepData = document.getElementById('unKeep').checked ? '1' : '0';
+  closeUninstall();
+  document.getElementById('unProgMask').classList.add('on');
+  setUnProgress(5, keepData === '1' ? '正在打包应用数据（7z 极限压缩）…' : '正在删除程序与数据…');
+
+  const fd = new FormData();
+  fd.append('confirm', '1');
+  fd.append('keep_data', keepData);
+
+  fetch('/lanzou-test.php?ajax=uninstall', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(j => {
+      if (j.code !== 0) {
+        setUnProgress(100, '卸载失败：' + (j.msg || ''));
+        toast('卸载失败：' + (j.msg || ''), 'err');
+        return;
+      }
+      pollUninstall(0);
+    })
+    .catch(e => {
+      setUnProgress(100, '卸载失败：请求异常');
+    });
+}
+
+function pollUninstall(n) {
+  if (n > 60) { setUnProgress(100, '等待超时，请查看服务端日志'); return; }
+  fetch('/lanzou-test.php?ajax=uninstall_status')
+    .then(r => r.json())
+    .then(j => {
+      const d = j.data || {};
+      if (d.error) { setUnProgress(100, '卸载失败：' + d.error); return; }
+      setUnProgress(Number(d.percent || 0), d.stage || '正在卸载程序…');
+      if (d.done) {
+        setUnProgress(100, '卸载完成' + (d.archive ? '，数据已备份：' + d.archive.split('/').pop() : ''));
+        toast('卸载完成，服务已停止，可关闭页面', 'ok');
+        return;
+      }
+      setTimeout(() => pollUninstall(n + 1), 700);
+    })
+    .catch(e => {
+      // 程序已退出，接口自然拿不到
+      setUnProgress(100, '卸载完成，服务已停止');
+      toast('卸载完成，程序已退出，可关闭页面', 'ok');
+    });
 }
 
 function toggleAutoUpdate() {
